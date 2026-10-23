@@ -164,12 +164,12 @@
       }
 
       #carOptions {
-        display: flex;
+        display: grid;
+        grid-template-columns: 1fr 1fr; /* legacy cars on the first row, 2025 cars on the second */
         gap: 10px;
       }
 
       #carOptions button {
-        flex: 1;
         font:
           500 18px "Inter",
           system-ui,
@@ -187,6 +187,19 @@
         border-color: #5cbd68;
         background: #5cbd68;
         color: #fff;
+      }
+
+      @media (max-width: 480px) {
+        .picker-card {
+          max-width: calc(100vw - 32px);
+          box-sizing: border-box;
+          padding: 16px;
+        }
+
+        #carOptions button {
+          font-size: 15px;
+          padding: 12px 8px;
+        }
       }
 
       body.dark-mode .picker-card {
@@ -685,13 +698,13 @@
         const CURVE_EASE = 2.5; // how quickly the road bends to follow the steering (per second)
         const CAR_SCALE = 1.25; // car size on the road (1 = true size); bigger reads more easily in the lane
         const TRAFFIC_SCALE = 0.88; // blind-spot cars' size relative to ours, so they don't overpower it
-        // The cars: Model Y and Model 3 can be the main car (long-press the screen to switch);
-        // all three show up at random as the cars in the blind spots.
+        // The cars: the legacy and 2025 (Highland / Juniper) Model 3 and Model Y can be the main car
+        // (long-press the screen to switch); all of them show up at random as the cars in the blind spots.
         const CARS = {
-          modelY: { file: "model_y.glb", name: "Model Y" },
+          modelY: { file: "model_y.glb", name: "Legacy Model Y" },
           model3: {
             file: "model_3.glb",
-            name: "Model 3",
+            name: "Legacy Model 3",
             // the file has no floor (you can see into the cabin from below, and in the Park reflection),
             // so close it with flat black panels just above the sills: [half width, front z, rear z, height],
             // narrower around the wheels so they don't cut into the tires, and tucked up under the
@@ -699,9 +712,11 @@
             underbody: [[0.58, 2.15, 1.2, 0.17], [0.8, 1.2, -0.95, 0.17], [0.58, -0.95, -2.0, 0.25]],
           },
           cybertruck: { file: "cybertruck.glb", name: "Cybertruck" },
+          model32025: { file: "model_3_2025.glb", name: "Highland Model 3" },
+          modelY2025: { file: "model_y_2025.glb", name: "Juniper Model Y" },
         };
-        const MAIN_CARS = ["modelY", "model3"];
-        const TRAFFIC_CARS = ["modelY", "model3", "cybertruck"];
+        const MAIN_CARS = ["model3", "modelY", "model32025", "modelY2025"]; // picker order
+        const TRAFFIC_CARS = ["modelY", "model3", "cybertruck", "modelY2025", "model32025"];
         const LANE = 3.7; // lane width in meters (matches the road shader)
         // Park "studio" floor near the car, as a share of the background brightness on screen
         // (light mode), and its on-screen gray in dark mode
@@ -1537,7 +1552,10 @@
         function cyclePaint() {
           state.paint = (state.paint + 1) % PAINTS.length;
           saveAppData({ ...loadAppData(), paint: state.paint });
-          toast.textContent = PAINTS[state.paint][0];
+          showToast(PAINTS[state.paint][0]);
+        }
+        function showToast(text) {
+          toast.textContent = text;
           toast.style.opacity = "1";
           clearTimeout(toastTimer);
           toastTimer = setTimeout(() => (toast.style.opacity = "0"), 1400);
@@ -1651,6 +1669,16 @@
         let forcedTrafficCar = null; // set by a demo to always use one car in the blind spots
         function update(car) {
           forcedTrafficCar = TRAFFIC_CARS.includes(car.demoTrafficCar) ? car.demoTrafficCar : null;
+          // a demo can show a car and paint without saving them as the user's choice
+          if (MAIN_CARS.includes(car.demoCar) && car.demoCar !== state.car) {
+            state.car = car.demoCar;
+            loadCar(car.demoCar).catch(() => {});
+            showToast(CARS[car.demoCar].name);
+          }
+          if (PAINTS[car.demoPaint] && car.demoPaint !== state.paint) {
+            state.paint = car.demoPaint;
+            if (car.gear !== 1) showToast(PAINTS[state.paint][0]); // in Park the car's name is showing
+          }
           const gear =
             { 1: "P", 2: "R", 3: "N", 4: "D" }[parseInt(car.gear)] || "D";
           state.steer = Math.max(
@@ -1702,7 +1730,7 @@
           state.dprCap =
             { 1: 1, 2: 1.5, 3: 2 }[parseInt(car.renderQuality)] || 2;
         }
-        window.CarScene = { update };
+        window.CarScene = { update, cars: MAIN_CARS, paints: PAINTS.length }; // the list and count are for the demo
 
         // A point on the road: s meters ahead along the curve, x meters to the left of our lane's center.
         // Returns world [x, z, heading] using the same arc as the road shader.
@@ -2414,10 +2442,16 @@
       // otherwise connect to a local websocket feed like web-vanilla does.
       (function () {
         const params = new URLSearchParams(location.search);
-        // ?demo=cycle: a 30 s loop. Park -> drive away, cruise past a Cybertruck, slow for a red light that
-        // turns green and drive through it, slow to a stop -> reverse a little -> Park.
+        // ?demo=cycle: a 34 s loop. Park showing each of the cars in turn -> drive away, cycling through the
+        // paints, cruise past a Cybertruck, slow for a red light that turns green and drive through it,
+        // slow to a stop -> reverse a little -> Park.
         if (params.get("demo") === "cycle") {
-          const LOOP = 30;
+          const SHOWCASE = 8, // s in Park at the start, split between the cars
+            LOOP = 26 + SHOWCASE;
+          const cars = window.CarScene.cars || [],
+            paints = window.CarScene.paints || 1;
+          const CAR_TIME = SHOWCASE / Math.max(cars.length, 1),
+            PAINT_TIME = 20 / paints; // the drive (4-24 s on the timeline below) shows every paint
           const LIGHT_AT = 13, // s: a traffic light appears this far ahead,
             LIGHT_DIST = 70, // m
             LIGHT_GREEN = 17; // s: red until here, then green
@@ -2429,7 +2463,9 @@
           let lastT = 0,
             lineDist = 0; // meters to the traffic light's stop line, counted down as the car drives
           setInterval(() => {
-            const t = ((performance.now() - t0) / 1000) % LOOP;
+            const r = ((performance.now() - t0) / 1000) % LOOP;
+            // the timeline below runs 0-30 s with Park until 4 s; the showcase stretches that Park to SHOWCASE
+            const t = r < SHOWCASE ? (r * 4) / SHOWCASE : r - SHOWCASE + 4;
             const dt = t >= lastT ? t - lastT : 0;
             lastT = t;
             let gear, speed, steer, power;
@@ -2474,6 +2510,8 @@
               // left blinker and a Cybertruck in the left blind spot during the cruise
               leftBlinker: t > 9.5 && t < 12 ? (Math.floor(t * 2.5) % 2 ? 2 : 1) : 0,
               demoTrafficCar: "cybertruck",
+              demoCar: cars[Math.min(Math.floor(r / CAR_TIME), cars.length - 1)],
+              demoPaint: Math.min(Math.floor(Math.max(t - 4, 0) / PAINT_TIME), paints - 1),
               rightBlinker: 0,
               adasOn: driving,
               accSetSpeed: driving ? 65 : 0,
