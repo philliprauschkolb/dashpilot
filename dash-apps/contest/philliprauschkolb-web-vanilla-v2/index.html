@@ -694,8 +694,17 @@
         const MAX_YAW = 10; // body angle limit in degrees
         const WHEEL_GAIN = 1.8; // front wheels turn this much more than real, so steering is easy to see
         const MAX_WHEEL = 35; // front wheel angle limit in degrees
-        const MIN_RADIUS = 55; // tightest road curve in meters, reached at full steering lock
-        const CURVE_EASE = 2.5; // how quickly the road bends to follow the steering (per second)
+        const MIN_RADIUS = 55; // road curve radius in meters at full steering lock, before ROAD_SHAPE's shares
+        // How the road bends along its length. bend: [from (meters along the road from our car), share of the
+        // MIN_RADIUS curvature] for each stretch; ease: how quickly the road follows the steering (per second).
+        // "near" bends hardest right in front of the car and straightens out further on, so turning the wheel
+        // shows at once; "arc" is the original even arc all the way out. Set ROAD_SHAPE to ROAD_SHAPES.arc to go back.
+        const ROAD_SHAPES = {
+          near: { bend: [[-40, 2.5], [20, 0.6], [45, 0.1]], ease: 6 },
+          arc: { bend: [[-40, 1], [15, 1], [35, 1]], ease: 2.5 },
+        };
+        const ROAD_SHAPE = ROAD_SHAPES.near;
+        const CURVE_EASE = ROAD_SHAPE.ease;
         const CAR_SCALE = 1.25; // car size on the road (1 = true size); bigger reads more easily in the lane
         const TRAFFIC_SCALE = 0.88; // blind-spot cars' size relative to ours, so they don't overpower it
         // The cars: the legacy and 2025 (Highland / Juniper) Model 3 and Model Y can be the main car
@@ -739,8 +748,10 @@
         const VIEWS = {
           D: { az: 0, el: 0.33, dist: 19.0, target: [0, 0.6, 4.5] },
           N: { az: 0, el: 0.33, dist: 17.0, target: [0, 0.6, 4.0] },
-          P: { az: -2.48, el: 0.07, dist: 7.4, target: [0.55, 0.62, 0.75] }, // front-left three-quarter, low, like the Tesla's own screen
-          R: { az: 0, el: 1.3, dist: 13.0, target: [0, 0.0, -1.0] },
+          // front-left three-quarter, low, like the Tesla's own screen; the target sits off to the side of the car
+          // so it lands centered in the space right of the gauges (landscape phone)
+          P: { az: -2.48, el: 0.07, dist: 7.4, target: [-1.1, 0.95, 0.85] },
+          R: { az: 0, el: 1.3, dist: 13.0, target: [0, 0.6, 0] }, // top-down, car centered
         };
 
         const state = {
@@ -981,7 +992,9 @@
         const GROUND_FS = `#version 300 es
   precision highp float; ${COMMON}
   in vec3 vP; out vec4 o;
-  uniform vec3 uCam, uAdasC; uniform float uRoad, uK, uAdas, uTime, uStop, uHead;
+  uniform vec3 uCam, uAdasC; uniform float uRoad, uAdas, uTime, uStop, uHead;
+  uniform vec4 uSeg[3];      // the road's center line, arcs end to end: start x, start z, start heading, curvature
+  uniform float uSegS[3];    // where each arc starts, meters along the road from our car
   uniform float uCarScale;   // CAR_SCALE
   uniform vec4 uCars[3];     // contact shadows: x, z, yaw, strength (0 = none); [0] is our car
   uniform vec4 uCarDims[3];  // each car at true size: half width (outer tire edge), half length, front axle z, rear axle z
@@ -992,14 +1005,23 @@
   float band(float x, float c, float w){ float f = fwidth(x) * 1.2; return smoothstep(c - w - f, c - w + f, x) - smoothstep(c + w - f, c + w + f, x); }
   vec2 carFrame(vec2 p, vec4 car){ vec2 d = p - car.xy; float cs = cos(car.z), sn = sin(car.z); return vec2(cs * d.x - sn * d.y, sn * d.x + cs * d.y); }
   void main(){
-    // Road follows a circular arc tangent to the car's heading. uK is curvature (1/radius), + bends left (+X).
-    float x = vP.x, z = vP.z;
-    if (abs(uK) > 1e-5) {
-      float Rr = 1.0 / uK, sg = sign(Rr);
-      vec2 d = vec2(vP.x - Rr, vP.z);
-      float rho = length(d);
-      x = sg * (abs(Rr) - rho);
-      z = atan(d.y, -d.x * sg) * abs(Rr);
+    // Road coordinates (x across, + toward +X; z along) from the arc segment this point lies beside
+    float x = vP.x, z = vP.z, best = 1e9;
+    for (int i = 0; i < 3; i++) {
+      vec4 g = uSeg[i];
+      vec2 p = vP.xz - g.xy, t = vec2(sin(g.z), cos(g.z)), n = vec2(t.y, -t.x);
+      float sl, xl;
+      if (abs(g.w) < 1e-6) { sl = dot(p, t); xl = dot(p, n); }
+      else {
+        float R = 1.0 / g.w;
+        vec2 v0 = -R * n, v = p - R * n;   // from the arc's center to its start, and to this point
+        sl = -atan(v0.x * v.y - v0.y * v.x, dot(v0, v)) * R;
+        xl = sign(R) * (abs(R) - length(v));
+      }
+      float len = i < 2 ? uSegS[i + 1] - uSegS[i] : 1e6;
+      float outside = max(i == 0 ? 0.0 : -sl, sl - len);   // the first arc also runs on behind its start
+      float score = abs(xl) + 1000.0 * max(outside, 0.0);
+      if (score < best) { best = score; x = xl; z = uSegS[i] + sl; }
     }
     float zl = z;   // distance along the road from our car
     z += uRoad; float ax = abs(x);
@@ -1734,14 +1756,30 @@
 
         // A point on the road: s meters ahead along the curve, x meters to the left of our lane's center.
         // Returns world [x, z, heading] using the same arc as the road shader.
+        // The road's center line is arcs end to end (ROAD_SHAPE), through our car at s = 0 heading along +z.
+        // Each segment: [start s, start x, start z, start heading (+ toward +X), curvature (+ bends toward +X)]
+        let roadSegs = [];
+        function arcStep(x, z, h, k, ds) {
+          if (Math.abs(k) < 1e-6) return [x + Math.sin(h) * ds, z + Math.cos(h) * ds, h];
+          const h2 = h + k * ds;
+          return [x + (Math.cos(h) - Math.cos(h2)) / k, z + (Math.sin(h2) - Math.sin(h)) / k, h2];
+        }
+        function setRoadSegs() {
+          const b = ROAD_SHAPE.bend;
+          let [x, z, h] = arcStep(0, 0, 0, state.curv * b[0][1], b[0][0]); // back from our car to the first start
+          roadSegs = b.map(([s0, share], i) => {
+            const seg = [s0, x, z, h, state.curv * share];
+            if (i + 1 < b.length) [x, z, h] = arcStep(x, z, h, seg[4], b[i + 1][0] - s0);
+            return seg;
+          });
+        }
+        setRoadSegs();
+        // world [x, z, heading] of the point s meters along the road and x meters across it (+ toward +X)
         function roadPoint(s, x) {
-          const k = state.curv;
-          if (Math.abs(k) < 1e-5) return [x, s, 0];
-          const R = 1 / k,
-            sg = Math.sign(R),
-            rho = Math.abs(R) - x * sg,
-            th = s / Math.abs(R);
-          return [R - sg * rho * Math.cos(th), rho * Math.sin(th), sg * th];
+          let g = roadSegs[0];
+          for (const seg of roadSegs) if (s >= seg[0]) g = seg;
+          const [cx, cz, h] = arcStep(g[1], g[2], g[3], g[4], s - g[0]);
+          return [cx + Math.cos(h) * x, cz - Math.sin(h) * x, h];
         }
 
         // ---------- drawing ----------
@@ -1934,6 +1972,7 @@
             cam.target[i] += (view.target[i] - cam.target[i]) * ease(dt, 2.5);
           const targetK = -state.steerShown / STEER_LOCK / MIN_RADIUS;
           state.curv += (targetK - state.curv) * ease(dt, CURVE_EASE);
+          setRoadSegs();
           const roadDeg = -state.steerShown / STEER_RATIO; // + = front wheels point left
           const clampDeg = (v, lim) => Math.max(-lim, Math.min(lim, v));
           const yaw = (clampDeg(roadDeg * YAW_GAIN, MAX_YAW) * Math.PI) / 180;
@@ -2038,7 +2077,8 @@
           gl.uniformMatrix4fv(groundProg.u.uVP, false, VP);
           gl.uniform3fv(groundProg.u.uCam, eye);
           gl.uniform1f(groundProg.u.uRoad, state.road);
-          gl.uniform1f(groundProg.u.uK, state.curv);
+          gl.uniform4fv(groundProg.u.uSeg, roadSegs.flatMap((g) => g.slice(1)));
+          gl.uniform1fv(groundProg.u.uSegS, roadSegs.map((g) => g[0]));
           gl.uniform1f(groundProg.u.uTime, state.time);
           gl.uniform1f(groundProg.u.uStop, state.stopDist);
           gl.uniform1f(groundProg.u.uHead, state.night);
